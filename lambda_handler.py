@@ -1,257 +1,122 @@
-"""
-Search Initializer Lambda
-Creates initial search document and triggers Step Functions workflow
-"""
-
 import json
-import boto3
-import uuid
 import os
-from datetime import datetime, timezone
-from typing import Dict, Any
-from pymongo import MongoClient
+from typing import Any, Dict, Optional, Tuple
 
-# Initialize AWS clients
-stepfunctions = boto3.client('stepfunctions')
+from config import Config, ConfigurationError
+from logging_config import get_logger
+from request_parser import RequestValidationError, parse_event
+from stepfunctions_client import StepFunctionsExecutor, WorkflowStartError
 
-# MongoDB setup
-MONGO_URI = os.getenv("MONGODB_URI")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "brace") 
-mongo_client = MongoClient(MONGO_URI)
-mongo_db = mongo_client[MONGO_DB_NAME]
-searchOutputCollection = mongo_db["searchOutput"]
+logger = get_logger(__name__)
 
-# Step Functions ARN (to be configured in deployment)
-STATE_MACHINE_ARN = os.getenv("LOGICAL_SEARCH_STATE_MACHINE_ARN")
+_config: Optional[Config] = None
+_executor: Optional[StepFunctionsExecutor] = None
 
-class SearchStatus:
-    """Search execution status tracking"""
-    NEW = "NEW"
-    HYDE_COMPLETE = "HYDE_COMPLETE"
-    SEARCH_COMPLETE = "SEARCH_COMPLETE"
-    RANK_AND_REASONING_COMPLETE = "RANK_AND_REASONING_COMPLETE"
-    ERROR = "ERROR"
+def lambda_handler(event: Optional[Dict[str, Any]], context: Any) -> Dict[str, Any]:
+    """AWS Lambda entrypoint triggered by API Gateway."""
+    if _is_options_request(event):
+        return _build_response(204, {})
 
-def create_initial_search_document(search_id: str, user_id: str, query: str, flags: Dict[str, Any]) -> Dict[str, Any]:
-    """Create initial search document in MongoDB"""
-    now = datetime.utcnow()
-    return {
-        "_id": search_id,
-        "userId": user_id,
-        "query": query,
-        "flags": flags,
-        "status": SearchStatus.NEW,
-        "createdAt": now,
-        "updatedAt": now,
-        "events": [
-            {
-                "stage": "INIT",
-                "message": "Search initiated",
-                "timestamp": now
-            }
-        ],
-        "metrics": {}
-    }
-
-def lambda_handler(event, context):
-    """
-    Initialize logical search and trigger Step Functions workflow
-    
-    Expected event format (from API Gateway):
-    {
-        "body": "{\"query\":\"...\", \"flags\":{...}}",
-        "requestContext": {
-            "authorizer": {
-                "userId": "..."
-            }
-        }
-    }
-    
-    OR direct invocation format:
-    {
-        "query": "...",
-        "flags": {...},
-        "userId": "..."
-    }
-    """
     try:
-        # Parse input event
-        if 'body' in event:
-            # API Gateway format
-            if isinstance(event['body'], str):
-                body = json.loads(event['body'])
-            else:
-                body = event['body']
-            
-            # Extract user ID from authorizer context (API Gateway integration)
-            user_id = event.get('requestContext', {}).get('authorizer', {}).get('userId')
-            if not user_id:
-                # Fallback to body for testing
-                user_id = body.get('userId', 'test_user')
-        else:
-            # Direct invocation format
-            body = event
-            user_id = event.get('userId')
+        config, executor = _get_runtime_dependencies()
+        execution_request = parse_event(event or {}, config)
 
-        # Extract parameters
-        query = body.get('query')
-        flags = body.get('flags', {})
-        
-        # Validate required fields
-        if not query:
-            return {
-                'statusCode': 400,
-                'body': json.dumps({
-                    'error': 'Missing required field: query',
-                    'success': False
-                })
-            }
-        
-        if not user_id:
-            return {
-                'statusCode': 400,
-                'body': json.dumps({
-                    'error': 'Missing user authentication',
-                    'success': False
-                })
-            }
+        trace_header = _extract_trace_header(event)
+        response = executor.start_execution(execution_request, trace_header=trace_header)
 
-        # Generate unique search ID
-        search_id = str(uuid.uuid4())
-        
-        # Set default flags
-        default_flags = {
-            'hyde_provider': 'groq_llama',
-            'description_provider': 'groq_llama', 
-            'reasoning_model': 'groq_llama',
-            'alternative_skills': False,
-            'reasoning': False,
-            'fallback': False
-        }
-        
-        # Merge with provided flags
-        final_flags = {**default_flags, **flags}
-        
-        print(f"Initializing search: {search_id} for user: {user_id}, query: {query}")
-        
-        # Create initial search document
-        search_doc = create_initial_search_document(search_id, user_id, query, final_flags)
-        
-        try:
-            searchOutputCollection.insert_one(search_doc)
-            print(f"Created search document: {search_id}")
-        except Exception as db_error:
-            print(f"Database error: {str(db_error)}")
-            return {
-                'statusCode': 500,
-                'body': json.dumps({
-                    'error': f'Failed to create search document: {str(db_error)}',
-                    'success': False
-                })
-            }
-        
-        # Prepare Step Functions execution input
-        sf_input = {
-            'searchId': search_id,
-            'userId': user_id,
-            'query': query,
-            'flags': final_flags,
-            'initiatedAt': datetime.utcnow().isoformat()
-        }
-        
-        # Start Step Functions execution
-        if STATE_MACHINE_ARN:
-            try:
-                execution_name = f"search-{search_id}"
-                response = stepfunctions.start_execution(
-                    stateMachineArn=STATE_MACHINE_ARN,
-                    name=execution_name,
-                    input=json.dumps(sf_input, default=str)
-                )
-                
-                execution_arn = response['executionArn']
-                print(f"Started Step Functions execution: {execution_arn}")
-                
-                # Update search document with execution ARN
-                searchOutputCollection.update_one(
-                    {"_id": search_id},
-                    {
-                        "$set": {
-                            "stepFunctionsExecutionArn": execution_arn,
-                            "updatedAt": datetime.utcnow()
-                        }
-                    }
-                )
-                
-            except Exception as sf_error:
-                print(f"Step Functions error: {str(sf_error)}")
-                # Update search document with error
-                searchOutputCollection.update_one(
-                    {"_id": search_id},
-                    {
-                        "$set": {
-                            "status": SearchStatus.ERROR,
-                            "error": {
-                                "stage": "INIT", 
-                                "message": f"Failed to start Step Functions: {str(sf_error)}",
-                                "occurredAt": datetime.utcnow()
-                            }
-                        }
-                    }
-                )
-                
-                return {
-                    'statusCode': 500,
-                    'body': json.dumps({
-                        'error': f'Failed to start search execution: {str(sf_error)}',
-                        'searchId': search_id,
-                        'success': False
-                    })
-                }
-        else:
-            print("Warning: STATE_MACHINE_ARN not configured - search document created but workflow not started")
-            
-        # Return search ID for tracking
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, Authorization'
-            },
-            'body': json.dumps({
-                'searchId': search_id,
-                'status': 'initiated',
-                'message': 'Search pipeline started successfully',
-                'query': query,
-                'flags': final_flags,
-                'success': True,
-                'timestamp': datetime.utcnow().isoformat()
-            })
-        }
-        
-    except Exception as e:
-        print(f"Initialization error: {str(e)}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps({
-                'error': f'Search initialization failed: {str(e)}',
-                'success': False,
-                'timestamp': datetime.utcnow().isoformat()
-            })
-        }
+        start_date = response.get("startDate")
+        if hasattr(start_date, "isoformat"):
+            start_date = start_date.isoformat()
 
-# For local testing
-if __name__ == "__main__":
-    test_event = {
-        "query": "Find experts in machine learning with Python experience",
-        "flags": {
-            "reasoning": True,
-            "alternative_skills": True
-        },
-        "userId": "test_user_123"
+        logger.info(
+            "Started search pipeline execution %s for search %s user %s",
+            response.get("executionName"),
+            execution_request.search_id,
+            execution_request.user_id,
+        )
+
+        body = {
+            "success": True,
+            "executionArn": response.get("executionArn"),
+            "executionName": response.get("executionName"),
+            "startDate": start_date,
+            "searchId": execution_request.search_id,
+            "userId": execution_request.user_id,
+            "query": execution_request.query,
+            "flags": execution_request.flags,
+            "pipeline": "search"
+        }
+        return _build_response(200, body)
+
+    except RequestValidationError as exc:
+        logger.warning("Request validation failed: %s", exc)
+        return _build_response(400, {"success": False, "error": str(exc)})
+    except ConfigurationError as exc:
+        logger.error("Configuration error detected: %s", exc)
+        return _build_response(500, {"success": False, "error": "Server configuration error"})
+    except WorkflowStartError as exc:
+        logger.error("Failed to start Step Functions execution: %s", exc)
+        return _build_response(502, {"success": False, "error": "Failed to start workflow"})
+    except Exception:  # pragma: no cover
+        logger.exception("Unhandled exception while starting workflow")
+        return _build_response(500, {"success": False, "error": "Internal server error"})
+
+
+def _get_runtime_dependencies() -> Tuple[Config, StepFunctionsExecutor]:
+    global _config, _executor
+
+    if _config is None:
+        _config = Config.load()
+        logger.debug("Configuration loaded for state machine %s", _config.state_machine_arn)
+    if _executor is None:
+        _executor = StepFunctionsExecutor(_config)
+        logger.debug("Step Functions client initialised")
+
+    return _config, _executor
+
+
+def _extract_trace_header(event: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not event or not isinstance(event, dict):
+        return None
+    headers = event.get("headers")
+    if not isinstance(headers, dict):
+        return None
+
+    return headers.get("X-Amzn-Trace-Id") or headers.get("x-amzn-trace-id")
+
+
+def _is_options_request(event: Optional[Dict[str, Any]]) -> bool:
+    if not event or not isinstance(event, dict):
+        return False
+    method = event.get("httpMethod") or event.get("requestContext", {}).get("httpMethod")
+    return isinstance(method, str) and method.upper() == "OPTIONS"
+
+
+def _build_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
+    cors_origin = _get_cors_origin()
+    headers = {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": cors_origin,
+        "Access-Control-Allow-Headers": "Content-Type,Authorization,X-Requested-With",
+        "Access-Control-Allow-Methods": "OPTIONS,POST",
     }
-    
-    result = lambda_handler(test_event, None)
-    print(json.dumps(result, indent=2, default=str))
+
+    if status_code == 204:
+        return {
+            "statusCode": status_code,
+            "headers": headers,
+            "body": "",
+        }
+
+    return {
+        "statusCode": status_code,
+        "headers": headers,
+        "body": json.dumps(body),
+    }
+
+
+def _get_cors_origin() -> str:
+    if _config is not None:
+        return _config.cors_allowed_origin or "*"
+    return os.getenv("CORS_ALLOWED_ORIGIN", "*")
+
